@@ -1,1 +1,8 @@
 agent-sre
+
+# Live Ollama + LiteLLM gateway demo (see README's "Live Ollama + LiteLLM
+# Gateway Demo" and "Streamlit Dashboard" sections)
+litellm[proxy]
+streamlit
+plotly
+pandas

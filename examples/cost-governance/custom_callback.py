@@ -2,7 +2,17 @@
 CostGuard and CostAnomalyDetector, so any client hitting this proxy
 (curl, a chat UI, another script) gets governed the same way the
 test_ollama.py demo governs its own direct calls.
+
+Also persists every event to a local SQLite DB (cost_events.db) and
+re-reads governance parameters from a shared config table before each
+request, so a separate Streamlit dashboard can display consumption and
+adjust budget parameters on the live gateway without a proxy restart.
 """
+
+import os
+import sqlite3
+import threading
+import time
 
 from fastapi import HTTPException
 
@@ -19,9 +29,9 @@ PRECHECK_ESTIMATE_COST = 0.15
 # Shared across every request that passes through this proxy process --
 # including org_monthly_budget below, which CostGuard aggregates across
 # every agent_id passed to record_cost/check_task on this same instance.
-# Lowered from 100.00 so it's actually reachable in a demo: run curl from
-# two terminals with different "user" values (e.g. "agent-a" / "agent-b")
-# and both draw down the *same* org-wide cap, visible from either terminal.
+# These are just the defaults used the very first time cost_events.db is
+# created -- after that, the Streamlit dashboard's saved config wins (see
+# _reload_config_from_db below).
 guard = CostGuard(
     per_task_limit=1.20,
     per_agent_daily_limit=2.00,
@@ -30,6 +40,93 @@ guard = CostGuard(
     kill_switch_threshold=0.95,
 )
 detector = CostAnomalyDetector()
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cost_events.db")
+_db_lock = threading.Lock()
+
+
+def _get_conn():
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def _init_db():
+    with _db_lock, _get_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                agent_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                tokens INTEGER NOT NULL,
+                cost REAL NOT NULL,
+                status TEXT NOT NULL,
+                spent_today REAL NOT NULL,
+                util_pct REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                per_task_limit REAL NOT NULL,
+                per_agent_daily_limit REAL NOT NULL,
+                org_monthly_budget REAL NOT NULL,
+                auto_throttle INTEGER NOT NULL,
+                kill_switch_threshold REAL NOT NULL
+            )
+        """)
+        row = conn.execute("SELECT id FROM config WHERE id = 1").fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO config (id, per_task_limit, per_agent_daily_limit, "
+                "org_monthly_budget, auto_throttle, kill_switch_threshold) "
+                "VALUES (1, ?, ?, ?, ?, ?)",
+                (guard.per_task_limit, guard.per_agent_daily_limit, guard.org_monthly_budget,
+                 int(guard.auto_throttle), guard.kill_switch_threshold),
+            )
+
+
+def _reload_config_from_db():
+    """Pick up whatever the Streamlit dashboard last saved and apply it to
+    the live guard. Called before every request, so a parameter change takes
+    effect on the very next call -- no proxy restart needed.
+    """
+    with _db_lock, _get_conn() as conn:
+        row = conn.execute(
+            "SELECT per_task_limit, per_agent_daily_limit, org_monthly_budget, "
+            "auto_throttle, kill_switch_threshold FROM config WHERE id = 1"
+        ).fetchone()
+    if row is None:
+        return
+    per_task_limit, per_agent_daily_limit, org_monthly_budget, auto_throttle, kill_switch_threshold = row
+
+    guard.per_task_limit = per_task_limit
+    guard.org_monthly_budget = org_monthly_budget
+    guard.auto_throttle = bool(auto_throttle)
+    guard.kill_switch_threshold = kill_switch_threshold
+
+    # per_agent_daily_limit is snapshotted onto each AgentBudget the moment
+    # it's first created (see CostGuard._get_or_create_budget_locked), so an
+    # agent already seen this session won't pick up a change on its own --
+    # patch existing budgets directly when the value actually moves.
+    if per_agent_daily_limit != guard.per_agent_daily_limit:
+        guard.per_agent_daily_limit = per_agent_daily_limit
+        with guard._lock:
+            for budget in guard._budgets.values():
+                budget.daily_limit_usd = per_agent_daily_limit
+
+
+def _log_event(agent_id, task_id, tokens, cost, status, spent_today, util_pct):
+    with _db_lock, _get_conn() as conn:
+        conn.execute(
+            "INSERT INTO events (timestamp, agent_id, task_id, tokens, cost, status, spent_today, util_pct) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), agent_id, task_id, tokens, cost, status, spent_today, util_pct),
+        )
+
+
+_init_db()
 
 
 def _get_usage(response_obj):
@@ -74,10 +171,15 @@ class CostGovernanceLogger(CustomLogger):
         """Runs before Ollama is ever called. Blocks the request outright if
         CostGuard says the agent (or the shared org budget) is out of room.
         """
+        _reload_config_from_db()
+
         agent_id = (data.get("user") if data else None) or "default-agent"
         allowed, reason = guard.check_task(agent_id, estimated_cost=PRECHECK_ESTIMATE_COST)
         if not allowed:
             print(f"[CostGuard] BLOCKED {agent_id}: {reason}")
+            budget = guard.get_budget(agent_id)
+            _log_event(agent_id, "blocked", 0, 0.0, "BLOCKED",
+                       budget.spent_today_usd, budget.utilization_percent)
             raise HTTPException(status_code=429, detail=f"Blocked by CostGuard: {reason}")
         return data
 
@@ -109,6 +211,9 @@ class CostGovernanceLogger(CustomLogger):
             status = f"{alert.severity.value.upper()} {action_str}".strip()
         else:
             status = "OK"
+
+        _log_event(agent_id, task_id, total_tokens, cost, status,
+                   budget.spent_today_usd, budget.utilization_percent)
 
         print(f"{agent_id:<{COL_WIDTHS['agent']}} {task_display:<{COL_WIDTHS['task']}} "
               f"{total_tokens:>{COL_WIDTHS['tokens']}} {cost:>{COL_WIDTHS['cost']}.4f} "

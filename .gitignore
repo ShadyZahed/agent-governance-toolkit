@@ -470,3 +470,12 @@ _site/
 # Code Security Assessment artifacts
 .security-assessment/
 *.tgz
+
+# Local runtime data for the cost-governance Streamlit dashboard demo
+examples/cost-governance/cost_events.db
+examples/cost-governance/cost_events.db-shm
+examples/cost-governance/cost_events.db-wal
+
+# OS/editor cruft
+.DS_Store
+.tar.gz
