@@ -152,10 +152,21 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
 
 ## Streamlit Dashboard
 
-`streamlit_app.py` is a live dashboard for the gateway above: overall and
-per-agent token/cost consumption, an org-wide budget bar, a consumption-over-
-time chart, and a settings panel that adjusts `CostGuard`'s parameters on the
-*running* gateway without a restart.
+A live, multi-page dashboard for the gateway above: overall and per-agent
+token/cost consumption, an org-wide budget bar, per-agent charts (bar/pie/
+radar), a cost-evolution-over-time chart, an estimated-vs-actual cost
+comparison, department-level filtering, and a settings panel that adjusts
+`CostGuard`'s parameters on the *running* gateway without a restart.
+
+### Files
+
+| File | Role |
+|---|---|
+| `streamlit_app.py` | Entry point / router. Owns the one-time `st.set_page_config`/`inject_css`/`ensure_db` calls and wires up `st.navigation(position="top")` so the page switcher renders as a horizontal bar above the content, not in the sidebar. **Run this file.** |
+| `dashboard_page.py` | The main dashboard body (KPIs, charts, sidebar governance form) — included by the router. |
+| `pages/1_Models.py` | Model registry — placeholder metadata for AI model/endpoints (no live connection, no credential values stored). |
+| `pages/2_Departments.py` | Department registry + agent-default fallback mapping (see tagging convention below). |
+| `shared.py` | DB access, styling, and helpers shared by all of the above. |
 
 ### How it connects to the gateway
 
@@ -177,6 +188,25 @@ Open the URL Streamlit prints (defaults to `http://localhost:8501`). The
 dashboard auto-refreshes its data every 5 seconds; the sidebar's parameter
 form is outside that auto-refresh loop so it won't reset mid-edit.
 
+### Department attribution
+
+Tag a request's `"user"` field as `"department/agent_id"` (e.g.
+`"marketing/default-agent"`) to attribute it to a department directly — that
+explicit tag always wins. `CostGuard` budgets stay keyed on the plain
+`agent_id` regardless, so a shared agent doesn't fragment across
+departments. Requests without an explicit tag fall back to whatever default
+department that `agent_id` is mapped to on the Departments page, then to
+`"Unassigned"` if neither exists. The main dashboard's Department filter
+(`All (Company-wide)` / a specific department) scopes every KPI, chart, and
+table below it.
+
+### Models to Track
+
+The sidebar's "Models to Track" control is a checkbox popover (multi-select)
+over the Models registry, backed by `config.active_model_ids`. Like
+Estimator Mode, this is currently a placeholder — the gateway doesn't route
+to any of these yet; it's just persisted for a future change to read.
+
 ### Notes
 
 - `per_task_limit`, `org_monthly_budget`, `auto_throttle`, and
@@ -184,5 +214,9 @@ form is outside that auto-refresh loop so it won't reset mid-edit.
   `per_agent_daily_limit` changes are also propagated to agents already seen
   this session (patched directly onto their existing budget), not just new
   ones — see the comment in `_reload_config_from_db`.
+- `events.estimated_cost` is a placeholder column, populated with a flat
+  constant (`custom_callback.py`'s `PRECHECK_ESTIMATE_COST`) until real
+  per-request cost estimation exists — the "Estimate vs Actual" view will
+  look like a vertical line of points until then.
 - `cost_events.db` (and its `-shm`/`-wal` WAL-mode sidecar files) are
   local runtime data, not committed to the repo.

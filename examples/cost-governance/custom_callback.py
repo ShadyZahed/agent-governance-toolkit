@@ -41,6 +41,12 @@ guard = CostGuard(
 )
 detector = CostAnomalyDetector()
 
+# Placeholder for a future feature: does NOT affect cost math yet. The
+# dashboard writes one of these into config.estimator_mode; this variable is
+# just where the gateway picks it up so a later change can read it here
+# instead of adding a new plumbing path.
+CURRENT_ESTIMATOR_MODE = "Balanced"
+
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cost_events.db")
 _db_lock = threading.Lock()
 
@@ -49,6 +55,26 @@ def _get_conn():
     conn = sqlite3.connect(DB_PATH, timeout=5)
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
+
+
+def _migrate_config_columns(conn):
+    """Add columns introduced after the original config table shipped, for
+    DBs created before they existed. SQLite has no "ADD COLUMN IF NOT
+    EXISTS", so check PRAGMA table_info first.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(config)").fetchall()}
+    if "estimator_mode" not in existing:
+        conn.execute("ALTER TABLE config ADD COLUMN estimator_mode TEXT DEFAULT 'Balanced'")
+
+
+def _migrate_events_columns(conn):
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(events)").fetchall()}
+    if "estimated_cost" not in existing:
+        # Placeholder for a future real per-request estimator -- until that
+        # exists, every row gets the same flat PRECHECK_ESTIMATE_COST value.
+        conn.execute("ALTER TABLE events ADD COLUMN estimated_cost REAL DEFAULT 0.0")
+    if "department" not in existing:
+        conn.execute("ALTER TABLE events ADD COLUMN department TEXT DEFAULT 'Unassigned'")
 
 
 def _init_db():
@@ -63,7 +89,9 @@ def _init_db():
                 cost REAL NOT NULL,
                 status TEXT NOT NULL,
                 spent_today REAL NOT NULL,
-                util_pct REAL NOT NULL
+                util_pct REAL NOT NULL,
+                estimated_cost REAL DEFAULT 0.0,
+                department TEXT DEFAULT 'Unassigned'
             )
         """)
         conn.execute("""
@@ -73,17 +101,33 @@ def _init_db():
                 per_agent_daily_limit REAL NOT NULL,
                 org_monthly_budget REAL NOT NULL,
                 auto_throttle INTEGER NOT NULL,
-                kill_switch_threshold REAL NOT NULL
+                kill_switch_threshold REAL NOT NULL,
+                estimator_mode TEXT DEFAULT 'Balanced'
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS departments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                created_at REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_departments (
+                agent_id TEXT PRIMARY KEY,
+                department_id INTEGER NOT NULL REFERENCES departments(id)
+            )
+        """)
+        _migrate_config_columns(conn)
+        _migrate_events_columns(conn)
         row = conn.execute("SELECT id FROM config WHERE id = 1").fetchone()
         if row is None:
             conn.execute(
                 "INSERT INTO config (id, per_task_limit, per_agent_daily_limit, "
-                "org_monthly_budget, auto_throttle, kill_switch_threshold) "
-                "VALUES (1, ?, ?, ?, ?, ?)",
+                "org_monthly_budget, auto_throttle, kill_switch_threshold, estimator_mode) "
+                "VALUES (1, ?, ?, ?, ?, ?, ?)",
                 (guard.per_task_limit, guard.per_agent_daily_limit, guard.org_monthly_budget,
-                 int(guard.auto_throttle), guard.kill_switch_threshold),
+                 int(guard.auto_throttle), guard.kill_switch_threshold, CURRENT_ESTIMATOR_MODE),
             )
 
 
@@ -92,19 +136,29 @@ def _reload_config_from_db():
     the live guard. Called before every request, so a parameter change takes
     effect on the very next call -- no proxy restart needed.
     """
+    global CURRENT_ESTIMATOR_MODE
     with _db_lock, _get_conn() as conn:
         row = conn.execute(
             "SELECT per_task_limit, per_agent_daily_limit, org_monthly_budget, "
-            "auto_throttle, kill_switch_threshold FROM config WHERE id = 1"
+            "auto_throttle, kill_switch_threshold, estimator_mode FROM config WHERE id = 1"
         ).fetchone()
     if row is None:
         return
-    per_task_limit, per_agent_daily_limit, org_monthly_budget, auto_throttle, kill_switch_threshold = row
+    (per_task_limit, per_agent_daily_limit, org_monthly_budget,
+     auto_throttle, kill_switch_threshold, estimator_mode) = row
 
     guard.per_task_limit = per_task_limit
     guard.org_monthly_budget = org_monthly_budget
     guard.auto_throttle = bool(auto_throttle)
     guard.kill_switch_threshold = kill_switch_threshold
+
+    # Placeholder: recorded but not yet used to change PRECHECK_ESTIMATE_COST
+    # or the real per-token cost math. See the CURRENT_ESTIMATOR_MODE comment
+    # above for where a future implementation would plug in.
+    new_mode = estimator_mode or "Balanced"
+    if new_mode != CURRENT_ESTIMATOR_MODE:
+        print(f"[CostGuard] Estimator mode changed: {CURRENT_ESTIMATOR_MODE} -> {new_mode}")
+    CURRENT_ESTIMATOR_MODE = new_mode
 
     # per_agent_daily_limit is snapshotted onto each AgentBudget the moment
     # it's first created (see CostGuard._get_or_create_budget_locked), so an
@@ -117,12 +171,47 @@ def _reload_config_from_db():
                 budget.daily_limit_usd = per_agent_daily_limit
 
 
-def _log_event(agent_id, task_id, tokens, cost, status, spent_today, util_pct):
+def _parse_user_tag(raw_user):
+    """Parse the "user" field per the "department/agent_id" convention
+    (e.g. "marketing/default-agent"). No "/" -> the whole value is the
+    agent_id and department is None, which falls back to the
+    agent_departments default mapping, then "Unassigned" -- see
+    _resolve_department. Missing/empty -> (None, "default-agent").
+    """
+    if not raw_user:
+        return None, "default-agent"
+    if "/" in raw_user:
+        dept, agent = raw_user.split("/", 1)
+        dept = dept.strip() or None
+        agent = agent.strip() or "default-agent"
+        return dept, agent
+    return None, raw_user
+
+
+def _resolve_department(explicit_department, agent_id):
+    """Explicit per-request tag wins. Otherwise fall back to whatever
+    department this agent_id defaults to (set on the Departments page).
+    Otherwise "Unassigned" -- never silently dropped.
+    """
+    if explicit_department:
+        return explicit_department
+    with _db_lock, _get_conn() as conn:
+        row = conn.execute(
+            "SELECT d.name FROM agent_departments ad JOIN departments d "
+            "ON ad.department_id = d.id WHERE ad.agent_id = ?",
+            (agent_id,),
+        ).fetchone()
+    return row[0] if row else "Unassigned"
+
+
+def _log_event(agent_id, task_id, tokens, cost, status, spent_today, util_pct,
+                estimated_cost=PRECHECK_ESTIMATE_COST, department="Unassigned"):
     with _db_lock, _get_conn() as conn:
         conn.execute(
-            "INSERT INTO events (timestamp, agent_id, task_id, tokens, cost, status, spent_today, util_pct) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (time.time(), agent_id, task_id, tokens, cost, status, spent_today, util_pct),
+            "INSERT INTO events (timestamp, agent_id, task_id, tokens, cost, status, "
+            "spent_today, util_pct, estimated_cost, department) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), agent_id, task_id, tokens, cost, status, spent_today, util_pct,
+             estimated_cost, department),
         )
 
 
@@ -173,13 +262,18 @@ class CostGovernanceLogger(CustomLogger):
         """
         _reload_config_from_db()
 
-        agent_id = (data.get("user") if data else None) or "default-agent"
+        # Department is purely a logging/analytics dimension -- CostGuard
+        # budgets stay keyed on agent_id alone, so "marketing/default-agent"
+        # and "sales/default-agent" still share the same underlying budget.
+        explicit_department, agent_id = _parse_user_tag(data.get("user") if data else None)
         allowed, reason = guard.check_task(agent_id, estimated_cost=PRECHECK_ESTIMATE_COST)
         if not allowed:
             print(f"[CostGuard] BLOCKED {agent_id}: {reason}")
             budget = guard.get_budget(agent_id)
+            department = _resolve_department(explicit_department, agent_id)
             _log_event(agent_id, "blocked", 0, 0.0, "BLOCKED",
-                       budget.spent_today_usd, budget.utilization_percent)
+                       budget.spent_today_usd, budget.utilization_percent,
+                       department=department)
             raise HTTPException(status_code=429, detail=f"Blocked by CostGuard: {reason}")
         return data
 
@@ -196,14 +290,17 @@ class CostGovernanceLogger(CustomLogger):
         total_tokens = _get_total_tokens(usage)
         cost = total_tokens * TOKEN_COST
 
-        # Pass "user": "<agent-name>" in the request body to attribute spend
-        # to a specific agent; requests without it fall under "default-agent".
-        agent_id = kwargs.get("user") or "default-agent"
+        # Pass "user": "<agent-name>" or "user": "<department>/<agent-name>"
+        # in the request body to attribute spend to a specific agent (and
+        # optionally a department); requests without it fall under
+        # "default-agent" / "Unassigned".
+        explicit_department, agent_id = _parse_user_tag(kwargs.get("user"))
         task_id = _get_response_id(response_obj)
         task_display = task_id if len(task_id) <= COL_WIDTHS["task"] else task_id[:COL_WIDTHS["task"] - 3] + "..."
 
         alerts = guard.record_cost(agent_id, task_id, cost_usd=cost)
         budget = guard.get_budget(agent_id)
+        department = _resolve_department(explicit_department, agent_id)
 
         if alerts:
             alert = alerts[0]
@@ -213,13 +310,16 @@ class CostGovernanceLogger(CustomLogger):
             status = "OK"
 
         _log_event(agent_id, task_id, total_tokens, cost, status,
-                   budget.spent_today_usd, budget.utilization_percent)
+                   budget.spent_today_usd, budget.utilization_percent,
+                   department=department)
 
         print(f"{agent_id:<{COL_WIDTHS['agent']}} {task_display:<{COL_WIDTHS['task']}} "
               f"{total_tokens:>{COL_WIDTHS['tokens']}} {cost:>{COL_WIDTHS['cost']}.4f} "
               f"{budget.spent_today_usd:>{COL_WIDTHS['spent_today']}.2f} "
               f"{budget.utilization_percent:>{COL_WIDTHS['util_pct']}.1f} "
               f"{status:<{COL_WIDTHS['status']}}")
+        print(f"  -> [Dept] {department}"
+              + (" (explicit tag)" if explicit_department else " (fallback/default)"))
 
         for alert in alerts:
             action_str = f" [{alert.action.value}]" if alert.action.value != "alert" else ""
